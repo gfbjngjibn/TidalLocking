@@ -1,12 +1,14 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using BepInEx;
 using UnityEngine;
 
 namespace TidalLocking
 {
-    [BepInPlugin("CuSO4.DSPMOD.TidalLocking", "TidalLocking", "1.0")]
+    [BepInPlugin("CuSO4.DSPMOD.TidalLocking", "TidalLocking", "1.1")]
     public class Locking : BaseUnityPlugin
     {
         /// <summary>
@@ -29,7 +31,15 @@ namespace TidalLocking
         /// </summary>
         private static PlanetData playerOn = null;
 
-        private static PlanetConfig config;
+        private static int playerOnIndex = 0;
+
+        private static bool unsave = false;
+
+        private static List<PlanetData> planets = new List<PlanetData>();
+
+        private static List<PlanetConfig> configs = new List<PlanetConfig>();
+
+        private static int seed = 0;
 
         private Thread th = new Thread(() =>
         {
@@ -48,40 +58,102 @@ namespace TidalLocking
 
         private Thread saveConfig = new Thread(() =>
         {
-            while (count>0)
+            while (true)
             {
-                count--;
-                Thread.Sleep(1000);
-            }
-            Console.WriteLine("saveConfig");
-            using (var bw = new BinaryWriter(new FileInfo(conifgPath).Create()))
-            {
-                bw.Write('b');
-                bw.Write(config.id);
-                bw.Write(config.seed);
-                bw.Write(config.orbitPhase);
+                Thread.Sleep(3000);
+                if (!unsave) continue;
+                while (count > 0)
+                {
+                    count--;
+                    Thread.Sleep(1000);
+                }
+                
+                Console.WriteLine("saveConfig");
+                var p = new PlanetConfig(playerOn.id, playerOn.seed, playerOn.orbitPhase);
+                if (configs.Count > 0 && configs[playerOnIndex].Equals(p))
+                {
+                    Console.WriteLine("cmp");
+                    var t = configs[playerOnIndex];
+                    t.orbitPhase = playerOn.orbitPhase;
+                    configs[playerOnIndex] = t;
+                }
+                else
+                {
+                    Console.WriteLine("else");
+                    var e = false;
+                    for (int i = 0; i < configs.Count; i++)
+                    {
+                        if (configs[i].Equals(p))
+                        {
+                            playerOnIndex = i;
+                            var t = configs[playerOnIndex];
+                            t.orbitPhase = playerOn.orbitPhase;
+                            configs[playerOnIndex] = t;
+                            e = true;
+                            break;
+                        }
+                    }
+
+                    if (!e)
+                    {
+                        Console.WriteLine("not e");
+                        configs.Add(p);
+                    }
+                }
+
+                Console.WriteLine("write");
+                using (var bw = new BinaryWriter(new FileInfo(conifgPath).Create()))
+                {
+                    bw.Write('c');
+                    bw.Write(GameMain.galaxy.seed);
+                    bw.Write(configs.Count);
+                    foreach (var config in configs)
+                    {
+                        bw.Write(config.id);
+                        bw.Write(config.seed);
+                        bw.Write(config.orbitPhase);
+                    }
+                }
+
+                unsave = false;
+                Console.WriteLine("save done");
             }
         });
 
         private Thread applyConfig = new Thread(() =>
         {
+            
             Console.WriteLine("applyConfig");
             while (true)
             {
-                if (!locked && playerOn != null)
+                Thread.Sleep(3000);
+                if (GameMain.galaxy == null || GameMain.galaxy.stars == null)
                 {
-                    Console.WriteLine("if in");
-                    var con = new PlanetConfig
-                        {id = playerOn.id, seed = playerOn.seed, orbitPhase = playerOn.orbitPhase};
-
-                    if (con.Equals(config))
-                    {
-                        Console.WriteLine("apply");
-                        playerOn.rotationPeriod = playerOn.orbitalPeriod;
-                        playerOn.orbitPhase = config.orbitPhase;
-                    }
+                    continue;
                 }
-                Thread.Sleep(2000);
+
+                if (seed != GameMain.galaxy.seed)
+                {
+                    Console.WriteLine("seed与配置不一致");
+                    continue;
+                }
+
+                for (int i = 0; i < configs.Count; i++)
+                {
+                    var p = GameMain.galaxy.PlanetById(configs[i].id);
+                    if (p == null)
+                    {
+                        Console.WriteLine(i);
+                        break;
+                    }
+
+                    planets.Add(p);
+                    p.rotationPeriod = p.orbitalPeriod;
+                    p.orbitPhase = configs[i].orbitPhase;
+                }
+
+                Console.WriteLine("apply");
+                break;
             }
         });
 
@@ -89,16 +161,19 @@ namespace TidalLocking
         private const int OPEN = 10;
         private static int times = 0;
         private static int count = 0;
+
         private static bool locked
         {
             get
             {
-                if (GameMain.galaxy==null)
+                if (GameMain.galaxy == null)
                 {
                     return false;
                 }
+
                 playerOn = GameMain.galaxy.PlanetById(GameMain.mainPlayer.planetId);
                 //Console.WriteLine("PlanetById");
+
                 return playerOn != null && ((int) playerOn.orbitalPeriod) == ((int) playerOn.rotationPeriod);
             }
         }
@@ -113,16 +188,59 @@ namespace TidalLocking
                 Console.WriteLine("Exists");
                 using (var bw = new BinaryReader(_fileinfo.OpenRead()))
                 {
-                    bw.ReadChar();
-                    config = new PlanetConfig {id = bw.ReadInt32(), seed = bw.ReadInt32(), orbitPhase = bw.ReadSingle()};
+                    if (bw.ReadChar() != 'c')
+                    {
+                        Console.WriteLine("跳过配置文件加载");
+                        return;
+                    }
+
+                    seed = bw.ReadInt32();
+                    var temp = bw.ReadInt32();
+                    for (var i = 0; i < temp; i++)
+                    {
+                        configs.Add(new PlanetConfig
+                            {id = bw.ReadInt32(), seed = bw.ReadInt32(), orbitPhase = bw.ReadSingle()});
+                    }
                 }
             }
 
             applyConfig.Start();
+            saveConfig.Start();
             Console.WriteLine("**********done**********");
         }
 
         private void FixedUpdate()
+        {
+            LockPlanet();
+
+            OrbitPhasePlus();
+
+            OrbitPhaseMinus();
+        }
+
+        private static void OrbitPhaseMinus()
+        {
+            if (Input.GetKeyDown(KeyCode.KeypadMinus) && locked)
+            {
+                UIRealtimeTip.Popup("将当前星球的公转相位-10");
+                playerOn.orbitPhase -= 10.0f;
+                count = 5;
+                unsave = true;
+            }
+        }
+
+        private static void OrbitPhasePlus()
+        {
+            if (Input.GetKeyDown(KeyCode.KeypadPlus) && locked)
+            {
+                UIRealtimeTip.Popup("将当前星球的公转相位+10");
+                playerOn.orbitPhase += 10.0f;
+                count = 5;
+                unsave = true;
+            }
+        }
+
+        private void LockPlanet()
         {
             if (Input.GetKeyDown(KeyCode.O))
             {
@@ -145,10 +263,8 @@ namespace TidalLocking
                             orbitPhase = playerOn.orbitPhase;
                             rotationPeriod = playerOn.rotationPeriod;
                             playerOn.rotationPeriod = playerOn.orbitalPeriod;
-                            config = new PlanetConfig(playerOn.id, playerOn.seed, playerOn.orbitPhase);
                             count = 5;
-                            try { saveConfig.Start(); }
-                            catch (ThreadStateException) { }
+                            unsave = true;
                         }
                     }
                     else
@@ -156,26 +272,6 @@ namespace TidalLocking
                         UIRealtimeTip.Popup("当前的星球为潮汐锁定");
                     }
                 }
-            }
-
-            if (Input.GetKeyDown(KeyCode.KeypadPlus) && locked)
-            {
-                UIRealtimeTip.Popup("将当前星球的公转相位+10");
-                playerOn.orbitPhase += 10.0f;
-                config.orbitPhase = playerOn.orbitPhase;
-                count = 5;
-                try { saveConfig.Start(); }
-                catch (ThreadStateException) { }
-            }
-
-            if (Input.GetKeyDown(KeyCode.KeypadMinus) && locked)
-            {
-                UIRealtimeTip.Popup("将当前星球的公转相位-10");
-                playerOn.orbitPhase -= 10.0f;
-                config.orbitPhase = playerOn.orbitPhase;
-                count = 5;
-                try { saveConfig.Start(); }
-                catch (ThreadStateException) { }
             }
         }
     }
